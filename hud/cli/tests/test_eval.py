@@ -30,6 +30,7 @@ from hud.eval import (
     RuntimeConfig,
     Task,
     Taskset,
+    TensorlakeRuntime,
 )
 from hud.settings import settings
 from hud.utils.gateway import GatewayModelInfo
@@ -206,7 +207,10 @@ def test_load_treats_unset_settings_as_unset(
         ('[eval]\nmodle = "x"\n', "modle"),
         ('[eval]\nremote = "false"\n', "remote must be a boolean"),
         ('[eval]\nagent = "not-an-agent"\n', "claude"),
-        ('[eval]\nruntime = "cloud"\n', "'local', 'hud', 'hosted', 'docker', 'modal' or 'daytona'"),
+        (
+            '[eval]\nruntime = "cloud"\n',
+            "'local', 'hud', 'hosted', 'docker', 'modal', 'daytona' or 'tensorlake'",
+        ),
         ("[other]\nx = 1\n", "unknown sections: other"),
     ],
 )
@@ -440,6 +444,7 @@ def test_explicit_placements(eval_cli: _EvalCli) -> None:
         ("docker", DockerRuntime),
         ("modal", ModalRuntime),
         ("daytona", DaytonaRuntime),
+        ("tensorlake", TensorlakeRuntime),
     ):
         eval_cli.invoke("tasks.py", "openai", "--runtime", name, "--yes")
         assert isinstance(eval_cli.kwargs["runtime"], cls)
@@ -447,7 +452,10 @@ def test_explicit_placements(eval_cli: _EvalCli) -> None:
 
 def test_unknown_runtime_lists_the_choices(eval_cli: _EvalCli) -> None:
     payload = eval_cli.invoke("tasks.py", "openai", "--runtime", "cloud", "--yes", exit_code=2)
-    assert "'local', 'hud', 'hosted', 'docker', 'modal' or 'daytona'" in payload["message"]
+    assert (
+        "'local', 'hud', 'hosted', 'docker', 'modal', 'daytona' or 'tensorlake'"
+        in payload["message"]
+    )
     assert "URL scheme should be 'tcp'" not in payload["message"]  # 'cloud' is not url-shaped
     payload = eval_cli.invoke("tasks.py", "openai", "--runtime", "http://x:1", "--yes", exit_code=2)
     assert "URL scheme should be 'tcp'" in payload["message"]
