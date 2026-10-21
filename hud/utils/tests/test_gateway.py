@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
+import httpx2
 import pytest
 
 from hud.settings import settings
@@ -30,13 +31,13 @@ async def test_openai_client_resolves_trace_id_per_request(
 ) -> None:
     seen_headers: dict[str, str] = {}
 
-    async def handler(request: httpx.Request) -> httpx.Response:
+    async def handler(request: httpx2.Request) -> httpx2.Response:
         trace_id = request.headers["Trace-Id"]
         await asyncio.sleep(0)
         seen_headers[request.url.path] = trace_id
-        return httpx.Response(200, json={"object": "list", "data": []})
+        return httpx2.Response(200, json={"object": "list", "data": []})
 
-    transport = httpx.MockTransport(handler)
+    transport = httpx2.MockTransport(handler)
     real_client_factory = gateway.DefaultAsyncHttpxClient
     monkeypatch.setattr(
         gateway,
@@ -69,12 +70,12 @@ async def test_openai_client_trace_context_overrides_empty_header(
 ) -> None:
     seen_trace_id: str | None = None
 
-    async def handler(request: httpx.Request) -> httpx.Response:
+    async def handler(request: httpx2.Request) -> httpx2.Response:
         nonlocal seen_trace_id
         seen_trace_id = request.headers["Trace-Id"]
-        return httpx.Response(200, json={"object": "list", "data": []})
+        return httpx2.Response(200, json={"object": "list", "data": []})
 
-    transport = httpx.MockTransport(handler)
+    transport = httpx2.MockTransport(handler)
     real_client_factory = gateway.DefaultAsyncHttpxClient
     monkeypatch.setattr(
         gateway,
@@ -103,12 +104,12 @@ async def test_openai_client_sends_child_and_parent_trace_ids(
 ) -> None:
     seen_headers: dict[str, str] = {}
 
-    async def handler(request: httpx.Request) -> httpx.Response:
+    async def handler(request: httpx2.Request) -> httpx2.Response:
         seen_headers["Trace-Id"] = request.headers["Trace-Id"]
         seen_headers["X-HUD-Parent-Trace-Id"] = request.headers["X-HUD-Parent-Trace-Id"]
-        return httpx.Response(200, json={"object": "list", "data": []})
+        return httpx2.Response(200, json={"object": "list", "data": []})
 
-    transport = httpx.MockTransport(handler)
+    transport = httpx2.MockTransport(handler)
     real_client_factory = gateway.DefaultAsyncHttpxClient
     monkeypatch.setattr(
         gateway,
@@ -314,6 +315,57 @@ async def test_gemini_async_request_includes_trace_id(
     assert attempts == (1 if initial_status == 200 else 2)
     if initial_status != 200:
         sleep.assert_awaited_once()
-        assert 10 <= sleep.await_args_list[0].args[0] <= 11
+        assert 3 <= sleep.await_args_list[0].args[0] <= 4
     else:
         sleep.assert_not_awaited()
+
+
+async def test_gemini_gateway_client_backoff_is_capped_at_five_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Four refusals in a row: the first wait is the header's 3 s and the rest stop at 5 s."""
+    sleep = AsyncMock()
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 4:
+            return httpx.Response(503, headers={"Retry-After": "1"}, json={"error": "overloaded"})
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": "ok"}], "role": "model"},
+                        "finishReason": "STOP",
+                        "index": 0,
+                    }
+                ],
+                "modelVersion": "gemini-test",
+                "usageMetadata": {
+                    "candidatesTokenCount": 1,
+                    "promptTokenCount": 1,
+                    "totalTokenCount": 2,
+                },
+            },
+        )
+
+    monkeypatch.setattr(
+        gateway.httpx,
+        "AsyncHTTPTransport",
+        MagicMock(return_value=httpx.MockTransport(handler)),
+    )
+    client = cast("GenaiClient", gateway.build_gateway_client("gemini"))
+    try:
+        response = await client.aio.models.generate_content(model="gemini-test", contents="hi")
+    finally:
+        await client.aio.aclose()
+
+    assert response.text == "ok"
+    assert attempts == 5
+    waits = [call.args[0] for call in sleep.await_args_list]
+    assert len(waits) == 4
+    assert 3 <= waits[0] <= 4
+    assert all(5 <= wait <= 6 for wait in waits[1:])

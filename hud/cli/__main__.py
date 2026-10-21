@@ -9,8 +9,9 @@ import os
 import sys
 import time
 import uuid
+import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TextIO
 
 import httpx
 import typer
@@ -20,6 +21,7 @@ from packaging.version import parse as parse_version
 from hud.cli import CLI, CliError, parse_key_value, set_env_values
 from hud.cli.deploy import deploy_command
 from hud.cli.eval import eval_command
+from hud.cli.harbor import harbor_app
 from hud.cli.init import init_command
 from hud.cli.jobs import cancel_job_command, jobs_app
 from hud.cli.models import models_app
@@ -30,6 +32,7 @@ from hud.cli.sync import sync_app
 from hud.cli.task import task_app
 from hud.cli.trace import trace_app
 from hud.settings import Settings
+from hud.utils.exceptions import HudDeprecationWarning
 from hud.utils.hud_console import HUDConsole
 from hud.version import __version__
 
@@ -234,6 +237,26 @@ def notify_if_outdated(argv: list[str]) -> None:
             cache.write_text(json.dumps({"latest": latest, "checked_at": time.time()}))
 
 
+def render_hud_warnings() -> None:
+    """Print ``HudDeprecationWarning`` through the console; other warnings keep Python's format."""
+    show_default = warnings.showwarning
+
+    def show(
+        message: Warning | str,
+        category: type[Warning],
+        filename: str,
+        lineno: int,
+        file: TextIO | None = None,
+        line: str | None = None,
+    ) -> None:
+        if issubclass(category, HudDeprecationWarning):
+            HUDConsole().warning(str(message))
+        else:
+            show_default(message, category, filename, lineno, file, line)
+
+    warnings.showwarning = show  # ty: ignore[invalid-assignment]
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     # Windows cmd.exe uses the system code page (e.g. cp1252) which can't
@@ -245,6 +268,7 @@ def main() -> None:
         if hasattr(sys.stderr, "buffer"):
             sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
+    render_hud_warnings()
     notify_if_outdated(sys.argv)
 
     with recorded_invocation(sys.argv, app):
@@ -258,6 +282,7 @@ app.command(name="eval")(eval_command)
 app.add_typer(task_app, name="task")
 app.add_typer(project_app, name="project")
 app.add_typer(sync_app, name="sync")
+app.add_typer(harbor_app, name="harbor")
 app.add_typer(qa_app, name="qa")
 app.add_typer(jobs_app, name="jobs")
 app.command(name="cancel", hidden=True, deprecated=True)(cancel_job_command)

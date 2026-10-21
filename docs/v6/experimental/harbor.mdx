@@ -1,6 +1,6 @@
 ---
 title: "Harbor interoperability"
-description: "Adapt Harbor tasks into runnable HUD tasksets and Compose artifacts, or export HUD tasks to Harbor folders."
+description: "Adapt Harbor tasks into runnable HUD tasksets and Compose artifacts, import Harbor tasks and job runs into HUD, or export HUD tasks to Harbor folders."
 icon: "ship"
 tag: "Experimental"
 ---
@@ -10,8 +10,10 @@ change without a major version.
 
 The **Harbor adapter** (`hud/integrations/harbor/`) translates between Harbor
 task directories and HUD's native `Environment`, `Task`, and `Taskset`
-contracts. `adapt()` packages Harbor tasks without building or publishing
+contracts. `adapt()` packages Harbor tasks without publishing
 images. `export()` materializes HUD tasks as self-contained Harbor folders.
+`hud harbor import` brings Harbor tasks and the runs Harbor recorded into a HUD
+taskset, to browse and compare them on the platform without running them again.
 
 ## Adapt Harbor tasks
 
@@ -44,18 +46,21 @@ packaged.
 
 ```text
 .hud-adapt/<environment>/
-├── build.sh
-├── compose.yaml
-├── env.py
+├── compose.yaml               # the Compose project the task rows and `hud deploy` run
+├── env.py                     # deploy identity
 ├── tasks.json
 └── compose-project/
-    ├── build.sh
-    ├── compose.json
-    ├── environment/
-    ├── hud/ or main/           # HUD build payload (depends on source shape)
+    ├── environment/           # authored build context
+    ├── main/                  # HUD build payload
     ├── tests/                 # inline-verifier task tests
     └── verifier/              # verifier-environment build context, when declared
 ```
+
+Adaptation requires a Docker-compatible builder when an authored image must be
+built or pulled. Images build for the builder's own platform, and a verifier
+environment builds for the same platform as the task's image. Tasks authored for
+`linux/amd64` often pin dependencies that publish no wheels elsewhere, so adapt
+them with `DOCKER_DEFAULT_PLATFORM=linux/amd64` on an arm64 host.
 
 The artifact is self-contained. Authored build contexts and Compose-relative
 paths are rebased beneath `compose-project/`; task instructions remain in
@@ -71,9 +76,9 @@ verifier image and artifact contract are task-specific.
 
 ### Run locally
 
-`DockerRuntime()` reads the Compose project from each task row, runs the adjacent
-`build.sh` preparation hook, starts the `main` service and its sidecars, and
-applies the workspace security profile automatically.
+`DockerRuntime()` reads the Compose project from each task row, starts the
+`main` service and its sidecars, and applies the workspace security profile
+automatically.
 
 The generated task data is independent from the environment build. Editing an
 instruction, verifier timeout, or inline `tests/` content updates `tasks.json`
@@ -90,14 +95,14 @@ Save the Compose configuration as `runtime.json` in the generated project root:
 Each generated environment is deployed separately, followed by its task rows:
 
 ```bash
-hud deploy .hud-adapt/<environment> --runtime-config .hud-adapt/<environment>/runtime.json
+hud deploy .hud-adapt/<environment>/env.py --runtime-config .hud-adapt/<environment>/runtime.json
 hud sync tasks my-harbor-tasks .hud-adapt/<environment>/tasks.json
 ```
 
 Hosted deploys build the project privately from the uploaded root; any registry
 image the project uses must be pullable by the hosted builder. The generated
-project can also be built and published on owned infrastructure; the commands
-and BuildKit context requirements are documented under
+project can also be built with `docker compose build` and published on owned
+infrastructure; see
 [Build on owned infrastructure](/v6/experimental/compose#build-on-owned-infrastructure).
 
 ### Verifier environments
@@ -116,7 +121,10 @@ The adapter handles:
 - an `environment/Dockerfile`, an `environment.docker_image`, or a Compose
   project; when authored Compose omits `main`, the environment recipe supplies
   that agent service;
-- Compose sidecars with any number of declared TCP endpoints;
+- the Compose variables Harbor defines (`CONTEXT_DIR`, `MAIN_IMAGE_NAME`,
+  `CPUS`, `MEMORY`, `PREBUILT_IMAGE_NAME`) and literal
+  `[environment.env]` values, alongside the project `.env`;
+- Compose sidecars, including ones that expose no TCP ports;
 - HTTP MCP servers (`sse` and `streamable-http`), healthchecks, network modes,
   allowlists, phase users, environment variables, and placement requirements;
 - inline verifier scripts and separate verifier Dockerfiles;
@@ -128,10 +136,49 @@ environment configures the actor task, and a separate verifier environment can
 configure its verifier task independently. The selected runtime decides whether
 it can provision those requirements.
 
-Unsupported declarations fail during adaptation. These include stdio MCP
-servers, skills directories, multi-step tasks, Compose variables not bound by
-the project `.env` or document defaults, `include`, and `extends`. A project
-also fails if its main service has neither an image nor a valid build recipe.
+stdio MCP servers and skills directories configure Harbor's own agents; the
+adapter accepts them and does not expose them to HUD agents.
+
+Unsupported declarations fail during adaptation. These include multi-step
+tasks, Compose variables only the host environment could supply, `include`,
+and `extends`. A project also fails if its main service has neither an image
+nor a valid build recipe.
+
+## Import into HUD
+
+`hud harbor import` copies Harbor task folders and job runs into a taskset, the way
+`harbor publish` and `harbor upload` send them to Harbor Hub:
+
+| Harbor | HUD |
+| --- | --- |
+| `harbor publish ./tasks` | `hud harbor import ./tasks --taskset <name>` |
+| `harbor upload ./jobs/<job>` | `hud harbor import ./jobs/<job> --taskset <name>` |
+
+One import can take both:
+
+```bash
+hud harbor import ./terminal-bench ./jobs/2026-10-01__12-00 --taskset tb2
+```
+
+The command zips the folders it is given (or takes one prepared zip), checks the zip
+against the 1 GiB limit, uploads it to your team's data store, and imports it into the
+taskset. It follows the import until it ends and prints a report of every task, job,
+and trial, with the reason for anything skipped or failed. `--no-wait` returns once the
+import starts; `hud harbor imports` lists imports, `hud harbor report <import-id>` prints
+a report later, and `hud harbor cancel <import-id>` stops a running import. The
+[`hud harbor` reference](/v6/reference/cli#hud-harbor) covers taskset selection and
+every option.
+
+`hud harbor import` exits `1` when the import did not complete (stopped, failed, or
+cancelled). Skipped and failed items are listed in the report and do not fail the
+command; `--json` returns the import and the full report for scripts.
+
+[Harbor import](/platform/harbor-import) describes the zip layout, what an import
+creates, the report, reruns, and limits. The web app's **Import from Harbor** takes the
+same zip, and the taskset's **Imports** tab lists the same imports.
+
+Imported tasks are for browsing and comparing runs; HUD cannot run them. To run Harbor
+tasks on HUD, [adapt](#adapt-harbor-tasks) and deploy them.
 
 ## Export HUD tasks to Harbor
 
@@ -179,7 +226,7 @@ covers that review.
 
 | Function | Contract |
 | --- | --- |
-| `harbor.adapt(path, *, hud_requirement="hud") -> AdaptResult` | Package valid tasks as generated Compose environments and native task rows, and return structured failures for the rest. Raises `ValueError` when no task directories exist. |
+| `harbor.adapt(path, *, hud_requirement=f"hud=={hud.__version__}") -> AdaptResult` | Package valid tasks as generated Compose environments and native task rows, and return structured failures for the rest. `hud_requirement` installs the controller each image serves (`hud.integrations.harbor.env`); pass a wheel path when adapting from an unreleased checkout. Raises `ValueError` when no task directories exist. |
 | `await harbor.export(source, out_dir, *, answer_file=..., timeout_sec=600) -> list[Path]` | Write HUD task rows as Harbor task directories. |
 
 <CardGroup cols={2}>

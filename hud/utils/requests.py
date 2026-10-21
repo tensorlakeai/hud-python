@@ -6,14 +6,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import ssl
 import time
+import warnings
 from typing import Any
 
 import httpx
 
 from hud.utils.exceptions import (
     HudAuthenticationError,
+    HudDeprecationWarning,
     HudNetworkError,
     HudRequestError,
     HudTimeoutError,
@@ -33,6 +36,10 @@ _DEFAULT_LIMITS = httpx.Limits(
 )
 
 
+_RETRY_STATUS_CODES = (429, 502, 503, 504)
+_MAX_RETRY_AFTER_SECONDS = 30.0
+
+
 def _retry_delay(
     attempt: int, max_retries: int, retry_delay: float, url: str, error_msg: str
 ) -> float:
@@ -49,6 +56,40 @@ def _retry_delay(
     return retry_time
 
 
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """The wait the API advised in ``Retry-After`` (delay-seconds form), capped; None if absent."""
+    value = response.headers.get("Retry-After")
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return min(seconds, _MAX_RETRY_AFTER_SECONDS)
+
+
+def _response_retry_wait(
+    response: httpx.Response, attempt: int, max_retries: int, retry_delay: float, url: str
+) -> float:
+    """Seconds to wait before retrying a response: the advised wait, else the shared backoff."""
+    advised = _retry_after_seconds(response)
+    if advised is None:
+        return _retry_delay(
+            attempt, max_retries, retry_delay, url, f"Received status {response.status_code}"
+        )
+    logger.debug(
+        "Received status %d from %s, retrying in %.2f seconds as advised (attempt %d/%d)",
+        response.status_code,
+        url,
+        advised,
+        attempt,
+        max_retries,
+    )
+    return advised
+
+
 def _create_default_async_client() -> httpx.AsyncClient:
     """Create a default httpx AsyncClient with standard configuration."""
     return httpx.AsyncClient(
@@ -62,6 +103,35 @@ def _create_default_sync_client() -> httpx.Client:
     return httpx.Client(
         timeout=_DEFAULT_TIMEOUT,
         limits=_DEFAULT_LIMITS,
+    )
+
+
+_announced_deprecations: set[tuple[str, str, str]] = set()
+
+
+def _warn_if_deprecated(method: str, response: httpx.Response) -> None:
+    """Warn once per process for each deprecation notice the HUD API sends."""
+    if "Deprecation" not in response.headers:
+        return
+    notice = (
+        response.headers["Deprecation"],
+        response.headers.get("Sunset", ""),
+        response.headers.get("Link", ""),
+    )
+    if notice in _announced_deprecations:
+        return
+    _announced_deprecations.add(notice)
+    message = f"{method} {response.url.path} is deprecated by the HUD API"
+    if sunset := response.headers.get("Sunset"):
+        message += f" and stops being served on {sunset}"
+    if successor := response.links.get("successor-version"):
+        message += f"; its replacement is {successor['url']}"
+    if docs := response.links.get("deprecation"):
+        message += f" (see {docs['url']})"
+    warnings.warn(
+        f"{message}. If a hud command printed this, upgrade hud.",
+        HudDeprecationWarning,
+        stacklevel=3,
     )
 
 
@@ -107,7 +177,6 @@ async def make_request(
         raise HudAuthenticationError("API key is required but not provided")
 
     headers = {"Authorization": f"Bearer {api_key}"}
-    retry_status_codes = [502, 503, 504]
     attempt = 0
     should_close_client = False
 
@@ -122,19 +191,13 @@ async def make_request(
             try:
                 response = await client.request(method=method, url=url, json=json, headers=headers)
 
-                # Check if we got a retriable status code
-                if response.status_code in retry_status_codes and attempt <= max_retries:
+                if response.status_code in _RETRY_STATUS_CODES and attempt <= max_retries:
                     await asyncio.sleep(
-                        _retry_delay(
-                            attempt,
-                            max_retries,
-                            retry_delay,
-                            url,
-                            f"Received status {response.status_code}",
-                        )
+                        _response_retry_wait(response, attempt, max_retries, retry_delay, url)
                     )
                     continue
 
+                _warn_if_deprecated(method, response)
                 response.raise_for_status()
                 result = _response_payload(response)
                 return result
@@ -192,7 +255,6 @@ def make_request_sync(
         raise HudAuthenticationError("API key is required but not provided")
 
     headers = {"Authorization": f"Bearer {api_key}"}
-    retry_status_codes = [502, 503, 504]
     attempt = 0
     should_close_client = False
 
@@ -207,19 +269,13 @@ def make_request_sync(
             try:
                 response = client.request(method=method, url=url, json=json, headers=headers)
 
-                # Check if we got a retriable status code
-                if response.status_code in retry_status_codes and attempt <= max_retries:
+                if response.status_code in _RETRY_STATUS_CODES and attempt <= max_retries:
                     time.sleep(
-                        _retry_delay(
-                            attempt,
-                            max_retries,
-                            retry_delay,
-                            url,
-                            f"Received status {response.status_code}",
-                        )
+                        _response_retry_wait(response, attempt, max_retries, retry_delay, url)
                     )
                     continue
 
+                _warn_if_deprecated(method, response)
                 response.raise_for_status()
                 result = _response_payload(response)
                 return result
